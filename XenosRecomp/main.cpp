@@ -1,5 +1,6 @@
 #include "shader.h"
 #include "shader_recompiler.h"
+#include "shader_common.h"
 #include "dxc_compiler.h"
 
 static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
@@ -27,6 +28,9 @@ struct RecompiledShader
     IDxcBlob* dxil = nullptr;
     std::vector<uint8_t> spirv;
     uint32_t specConstantsMask = 0;
+    uint32_t float4ConstantRegisters = 0;
+    uint32_t gatherSlots = 0;
+    uint32_t flags = 0;
 };
 
 int main(int argc, char** argv)
@@ -115,6 +119,12 @@ int main(int argc, char** argv)
 
         std::atomic<uint32_t> progress = 0;
 
+        // XENOS_RECOMP_DUMP_DIR=<folder>: also write every shader's HLSL and SPIR-V there, named by
+        // the hash the renderer and its profiler use, to study what the translator produces.
+        const char* dumpDir = getenv("XENOS_RECOMP_DUMP_DIR");
+        if (dumpDir != nullptr)
+            std::filesystem::create_directories(dumpDir);
+
         std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
             {
                 auto& shader = hashShaderPair.second;
@@ -124,6 +134,30 @@ int main(int argc, char** argv)
                 recompiler.recompile(shader.data, include);
 
                 shader.specConstantsMask = recompiler.specConstantsMask;
+#ifdef UNLEASHED_RECOMP
+                shader.float4ConstantRegisters = recompiler.float4RelativeAccess ? (recompiler.isPixelShader ? 224 : 256) :
+                    recompiler.float4ConstantRegisters;
+                shader.gatherSlots = recompiler.gatherSlots;
+                shader.flags = (recompiler.positionPassThrough ? SHADER_FLAG_POSITION_PASS_THROUGH : 0) |
+                    (recompiler.hasKill ? SHADER_FLAG_PIXEL_KILL : 0) |
+                    (recompiler.texcoordPassThrough ? SHADER_FLAG_TEXCOORD_PASS_THROUGH : 0) |
+                    (recompiler.hasKill ? 0 : recompiler.copyFlags);
+#else
+                shader.float4ConstantRegisters = recompiler.isPixelShader ? 224 : 256;
+#endif
+
+                if (dumpDir != nullptr)
+                {
+                    const std::string path = fmt::format("{}/{:016X}.{}.hlsl", dumpDir, hashShaderPair.first, recompiler.isPixelShader ? "ps" : "vs");
+                    writeAllBytes(path.c_str(), recompiler.out.data(), recompiler.out.size());
+#ifdef UNLEASHED_RECOMP
+                    if (!recompiler.sinkDebug.empty())
+                    {
+                        const std::string sinkPath = fmt::format("{}/{:016X}.sink.txt", dumpDir, hashShaderPair.first);
+                        writeAllBytes(sinkPath.c_str(), recompiler.sinkDebug.data(), recompiler.sinkDebug.size());
+                    }
+#endif
+                }
 
                 thread_local DxcCompiler dxcCompiler;
 
@@ -133,11 +167,22 @@ int main(int argc, char** argv)
                 assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
 #endif
 
-                IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+                IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true, recompiler.usesQuadOperations);
                 assert(spirv != nullptr);
 
                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
                 assert(result);
+
+                if (dumpDir != nullptr)
+                {
+                    // What the game passes to Vulkan: the smol-v blob decoded again (debug info stripped).
+                    std::vector<uint8_t> decoded(smolv::GetDecodedBufferSize(shader.spirv.data(), shader.spirv.size()));
+                    if (smolv::Decode(shader.spirv.data(), shader.spirv.size(), decoded.data(), decoded.size()))
+                    {
+                        const std::string path = fmt::format("{}/{:016X}.{}.spv", dumpDir, hashShaderPair.first, recompiler.isPixelShader ? "ps" : "vs");
+                        writeAllBytes(path.c_str(), decoded.data(), decoded.size());
+                    }
+                }
 
                 spirv->Release();
 
@@ -157,8 +202,9 @@ int main(int argc, char** argv)
 
         for (auto& [hash, shader] : shaders)
         {
-            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {} }},",
-                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask);
+            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {} }},",
+                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask,
+                shader.float4ConstantRegisters, shader.gatherSlots, shader.flags);
 
             if (shader.dxil != nullptr)
             {

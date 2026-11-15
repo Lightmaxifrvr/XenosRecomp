@@ -7,6 +7,8 @@
 #include <dxcapi.h>
 
 #include <bit>
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <execution>
